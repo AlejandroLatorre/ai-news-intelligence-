@@ -1,83 +1,55 @@
 # AI News Intelligence Platform
 
-A production-grade intelligence platform that turns the open web into structured, deduplicated, geographically-scoped news briefings about a target company, sector, or topic — and packages them as ready-to-deliver newsletters.
+This is an internal tool used in a consulting practice to produce weekly news briefings about specific companies. You give it a company name, a date range, a country, and a target language; it gives you back a curated newsletter that an analyst can send to a client without rewriting it.
 
-The platform was built as part of an enterprise consulting toolkit; the source code is not public. This repository documents what the product does, the design choices behind it, and the engineering problems it solves.
+The code lives in a private corporate repository. This README explains what the tool does and why it ended up built the way it is.
 
----
+## The job
 
-## What it does
+The starting point is always the same. A consultant needs a brief about, say, Iberdrola in Brazil over the last month, in English, by tomorrow. The expectation is somewhere between fifteen and thirty news items, deduplicated, organised into sections (M&A, regulation, products, leadership, ESG, and so on), with a short executive paragraph at the top and a forward-looking trends section at the bottom. The whole thing has to be delivered as both a styled HTML newsletter and a CSV that the analyst can pivot.
 
-Given a company (or sector / topic), a date range, a country and an output language, the platform produces a curated news brief in a single run:
+Done by hand, this is roughly half a day of reading. The platform brings it down to a few minutes of unattended runtime per company.
 
-1. **Discovers** candidate news from the open web using LLM-driven web search, scoped to the requested geography and time window.
-2. **Filters** the raw set deterministically: drops the wrong company (homonyms, brand collisions), the wrong country, the wrong dates, opinion pieces, press-release noise and duplicates.
-3. **Deduplicates** semantically across languages — the same event reported in three languages collapses to one entry.
-4. **Enriches** each surviving item with a normalized headline, summary, source, date and category.
-5. **Clusters** items into events (one acquisition, one product launch, one regulatory move) so the brief reads as a story, not a feed.
-6. **Generates** a newsletter: hero highlight, categorized sections, trends section, and a closing "opportunities" angle tailored to the consulting context.
-7. **Exports** to CSV (analyst use) and to a styled HTML newsletter (delivery use).
+## Why generic tools were not enough
 
-The full pipeline runs unattended in a few minutes per company.
+We tried the obvious shortcuts first. None of them held up.
 
----
+A direct call to a news API returns far too much noise on entity matches. Iberdrola in the US press is mostly about Avangrid; in the UK, ScottishPower; in Brazil, Neoenergia. A naive "must contain Iberdrola" filter throws all of those away. A relaxed filter lets in every "Iberdrola Móvil" customer service complaint that happens to share a brand prefix. The platform handles this with a per-company list of accepted brand variants and a separate list of protagonist tokens to exclude.
 
-## Why it exists
+LLM web search wrappers ignore geography. Asking a model for "news about company X in Spain" returns mostly Latin American press, because the model honours the language hint far more reliably than the country hint. Geography has to be enforced after the fetch, by reading where the news happened, not what language it is written in.
 
-Generic news APIs and LLM web-search wrappers fail in three ways that matter for client delivery:
+Semantic deduplication only works if you stop trusting the model to do it. Earlier versions of the pipeline asked the LLM to "decide which items are duplicates," which produced different answers on every run. The current version uses embeddings with three separately tuned thresholds: 0.82 for same-language pairs, 0.85 for cross-language pairs, and 0.78 for cross-language pairs that landed on the same day. Those numbers came out of a battery of test runs against hand-labelled clusters; they are not interchangeable.
 
-- **Wrong entity.** "Iberdrola" matches Avangrid, ScottishPower and Neoenergia in the US/UK/Brazil press; a naive search drops them. A naive *strict* search misses sub-brands. The platform supports configurable brand variants per company.
-- **Wrong geography / language mix.** A Spanish-language search for a Spanish multinational returns mostly Latin American press; a brief about *Spain* needs Spanish news that *affects Spain*, not news that happens to be in Spanish. Geo-scope is enforced post-retrieval, not via query tricks.
-- **Same event, many sources.** Reuters, Bloomberg, El País and Handelsblatt cover the same earnings release. Without semantic dedup the brief reads like a feed reader. The platform clusters cross-source, cross-language reports of the same event into one entry.
+## How the pipeline is structured
 
-The result is a brief an analyst can hand to a client without rewriting it.
+The pipeline alternates between deterministic Python and LLM calls, with the model confined to the steps where it actually adds value (drafting, summarising, judging meaning) and kept out of the steps where it drifts (date math, geography checks, exact-string matching).
 
----
+Discovery is the first LLM call. It runs a web search scoped to a country and a date window, and returns a list of candidate URLs and snippets. From there, the pipeline applies a series of deterministic filters: dates outside the window are dropped, opinion pieces and press releases are dropped, exact URL duplicates are dropped, and entity collisions are resolved against the brand-variant list.
 
-## Architecture (functional view)
+The surviving items go into the embeddings stage, which clusters them by meaning. A second, much more constrained LLM call walks the clusters and emits a structured decision per cluster: keep one item as the canonical version, drop the rest, optionally tag the cluster with an event label (one acquisition, one regulatory move, one product launch). Replacing a free-form "summarise these duplicates" prompt with this constrained shape is what stopped the phantom-drop bug that plagued earlier versions.
 
-The pipeline is deliberately split into deterministic and probabilistic stages, with the LLM confined to the steps where it adds the most value (drafting, summarizing, deduping by meaning) and kept out of the steps where it drifts (date filtering, geography filtering, exact-string filtering).
+Each surviving item is then enriched: a normalised headline, a sixty-word summary, a category, a date, a source. Enrichment runs with a hard retry policy because partial enrichment is worse than no enrichment at all.
 
-| Stage | Nature | Responsibility |
-|---|---|---|
-| Discovery | LLM web search | Generate candidate URLs and snippets within a country + date window |
-| Surface filters | Deterministic | Drop wrong-date, wrong-domain, opinion, duplicates by URL |
-| Entity filter | Deterministic + LLM-assisted | Resolve homonyms, accept configured brand variants, exclude protagonist tokens |
-| Geo filter | Deterministic | Verify the news *affects* the target country, not just that it is *written in* its language |
-| Semantic dedup | Embeddings | Cluster items by meaning, cross-language threshold tuned separately from same-language |
-| Event clustering | LLM (constrained) | Group items into events with `{keep, drop, event}` decisions |
-| Enrichment | LLM | Normalized headline, 60-word summary, category, date, source |
-| Brief assembly | Deterministic templating | Hero, categorized sections, trends, opportunities, footer |
-| Export | Deterministic | CSV (4 cached columns + run-time fields) and styled HTML newsletter |
+Finally, deterministic templating assembles the newsletter. The hero card carries the company name, the date range, and the company logo (served from a per-company logo endpoint). Below it sit the categorised sections, the trends panel (forward-looking, never retrospective), and a closing section called Opportunities that frames the news in terms of where the consulting practice could plausibly help. Footer text is hardcoded English, regardless of the body language.
 
-A second phase (in progress) adds a vector store for cross-run trend comparison ("what changed about company X between this run and last month").
+## Things that surprised us along the way
 
----
+A reasoning model with a generous output cap can still truncate silently if the reasoning tokens eat the cap. The aggregation step pins minimal reasoning effort and bumps the cap to sixteen thousand tokens; without those two settings, briefings would lose their last few items at random.
 
-## Engineering choices that mattered
+Aggressively simplifying an LLM filter prompt makes it less reliable, not more. Verbose, example-rich filter prompts beat terse ones in every battery of tests we ran. The deterministic surface around the prompt is the right place to optimise; the prompt itself wants to stay long.
 
-- **LLM-as-aggregator is unreliable.** Prior versions used an LLM to "decide which items are duplicates" — it drifted erratically run to run. The current pipeline moves surface-pattern dedup into deterministic code and reserves embeddings + clustering for semantic dedup.
-- **Reasoning budgets eat output budgets.** Aggregation calls on reasoning models silently truncate when reasoning tokens consume the response cap. The pipeline pins minimal reasoning effort (or raises the cap explicitly) for aggregation steps.
-- **Prompts that shrink lose quality faster than prompts that grow.** Aggressive simplification of LLM-filter prompts produced erratic behavior; the codebase keeps the verbose, example-rich filter prompts and only optimizes the deterministic surface around them.
-- **Cross-language same-day dedup needs its own threshold.** Same-event articles in two languages on the same day score lower on cosine similarity than same-language same-event articles. The pipeline uses three thresholds (same-language `0.82`, cross-language `0.85`, same-day cross-language `0.78`).
-- **Geographic scope is a post-filter, not a query parameter.** The platform fetches broadly and rejects later, because LLM web-search providers honor language hints far more reliably than country hints.
-
----
+Cross-language same-day deduplication is its own problem. Same-event coverage in two languages on the same day scores lower on cosine similarity than same-event coverage in one language on the same day. Treating those two cases with the same threshold either over-merges or under-merges. The third threshold exists to handle exactly that case.
 
 ## Output
 
-- **Newsletter (HTML).** Hero card with company + date range + logo, categorized news sections, trends panel (forward-looking, not retrospective), opportunities section, EN-only footer.
-- **CSV.** One row per news item with seven columns including normalized headline, summary, source, date, category, language, URL.
-- **Per-company logo endpoint** for embedding in delivered briefs.
-
----
+The HTML newsletter ships as a self-contained file with the hero card, the categorised sections, the trends panel, the opportunities section, and the footer. The CSV carries seven columns per row: normalised headline, summary, source, date, category, language, URL. Four of those columns are cached in the database so re-runs are cheap; the other three are recomputed.
 
 ## Status
 
-Active. Phase 1 (deterministic pipeline, semantic dedup, brand variants, CSV export, styled newsletter) is shipped to production. Phase 2 (cross-run trend vectors via pgvector) is pending infrastructure approval.
+Phase one is in production. The deterministic pipeline, the semantic deduplication, the brand-variant handling, the CSV export, and the styled newsletter are all shipped and used weekly.
 
----
+Phase two adds a vector store for cross-run trend comparison, so a consultant can ask "what changed about company X between this run and last month." It is currently waiting on infrastructure approval to deploy pgvector inside our network.
 
-## What this repository contains
+## About this repository
 
-This README. The code lives in a private corporate repository and is not redistributable.
+You will only find this README here. The code is not public.
